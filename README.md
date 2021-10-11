@@ -309,6 +309,10 @@ If you inspect the configuration file, you’ll find that there is a container t
 
 You can stop your cluster with `docker-compose -p citus down`.
 
+## Acknowledgement
+
+This work was based on Citus [docker][citus-docker] project.
+
 ## Tutorials
 
 From here on, you can choose to continue by trying the [tutorials][tutorials]
@@ -805,3 +809,4 @@ real-time analytical applications.
 [design-saas-db-for-high-scalibility]: https://www.citusdata.com/blog/2016/10/03/designing-your-saas-database-for-high-scalability/
 [shards]: https://docs.citusdata.com/en/stable/get_started/concepts.html#shards
 [create-dist-func]: https://docs.citusdata.com/en/stable/develop/api_udf.html#create-distributed-function
+[citus-docker]: https://github.com/citusdata/docker
