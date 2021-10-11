@@ -340,9 +340,9 @@ If you are using Docker, you should use the `docker cp` command to copy the
 files into the Docker container.
 
 ```sh
-docker cp companies.csv citus:.
-docker cp campaigns.csv citus:.
-docker cp ads.csv citus:.
+docker cp companies.csv cit_master:.
+docker cp campaigns.csv cit_master:.
+docker cp ads.csv cit_master:.
 ```
 
 #### Creating tables
@@ -565,6 +565,232 @@ ORDER BY total_impressions, total_clicks;
 With this, we come to the end of our tutorial on using Citus to power a simple
 multi-tenant application. As a next step, you can look at the Multi-Tenant Apps
 section to see how you can model your own data for multi-tenancy.
+
+### Real-time Analytics
+
+In this tutorial, we will demonstrate how you can use Citus to ingest events
+data and run analytical queries on that data in human real-time. For that, we
+will use a sample Github events dataset.
+
+#### Data model and sample data
+
+We will demo building the database for a real-time analytics application. This
+application will insert large volumes of events data and enable analytical
+queries on that data with sub-second latencies. In our example, we’re going to
+work with the Github events dataset. This dataset includes all public events on
+Github, such as commits, forks, new issues, and comments on these issues.
+
+We will use two Postgres tables to represent this data. To get started, you will
+need to download sample data for these tables:
+
+```sh
+curl https://examples.citusdata.com/tutorial/users.csv > users.csv
+curl https://examples.citusdata.com/tutorial/events.csv > events.csv
+
+wc -l users.csv
+264308 users.csv
+
+wc -l events.csv
+30000 events.csv
+```
+
+If you are using Docker, you should use the `docker cp` command to copy the
+files into the Docker container.
+
+```sh
+docker cp users.csv cit_master:.
+docker cp events.csv cit_master:.
+```
+
+#### Creating tables
+
+To start, you can first connect to the Citus coordinator using `psql`.
+
+If you are using native Postgres, as installed in our Single-Node Citus guide,
+the coordinator node will be running on port 9700.
+
+```sh
+psql -p 9700
+
+# I'm using Docker Compose configuration to run my Citus cluster.
+# So this command connect to the master container port 5432.
+psql -h 0.0.0.0 -U postgres
+```
+
+If you are using Docker, you can connect by running `psql` with the `docker exec`
+command:
+
+```sh
+docker exec -it cit_master psql -U postgres
+```
+
+Then, you can create the tables by using standard PostgreSQL `CREATE TABLE`
+commands.
+
+```sql
+CREATE TABLE github_events
+(
+    event_id bigint,
+    event_type text,
+    event_public boolean,
+    repo_id bigint,
+    payload jsonb,
+    repo jsonb,
+    user_id bigint,
+    org jsonb,
+    created_at timestamp
+);
+
+CREATE TABLE github_users
+(
+    user_id bigint,
+    url text,
+    login text,
+    avatar_url text,
+    gravatar_id text,
+    display_login text
+);
+```
+
+Next, you can create indexes on events data just like you would do in
+PostgreSQL. In this example, we’re also going to create a `GIN` index to make
+querying on `jsonb` fields faster.
+
+```sql
+CREATE INDEX event_type_index ON github_events (event_type);
+CREATE INDEX payload_index ON github_events USING GIN (payload jsonb_path_ops);
+```
+
+#### Distributing tables and loading data
+
+We will now go ahead and tell Citus to distribute these tables across the nodes
+in the cluster. To do so, you can run `create_distributed_table` and specify the
+table you want to shard and the column you want to shard on. In this case, we
+will shard all the tables on `user_id`.
+
+```sql
+SELECT create_distributed_table('github_users', 'user_id');
+SELECT create_distributed_table('github_events', 'user_id');
+```
+
+Sharding all tables on the user identifier allows Citus to colocate these tables
+together, and allows for efficient joins and distributed roll-ups.
+
+Then, you can go ahead and load the data we downloaded into the tables using the
+standard PostgreSQL `\COPY` command. Please make sure that you specify the
+correct file path if you downloaded the file to a different location.
+
+```sql
+\copy github_users from '/home/neo/huge_data/citus/users.csv' with csv
+COPY 264308
+
+\copy github_events from '/home/neo/huge_data/citus/events.csv' with csv
+COPY 30000
+```
+
+#### Running queries
+
+Now that we have loaded data into the tables, let’s go ahead and run some
+queries. First, let’s check how many users we have in our distributed database.
+
+```sql
+SELECT count(*) FROM github_users;
+ count  
+--------
+ 264308
+(1 row)
+```
+
+Now, let’s analyze Github push events in our data. We will first compute the
+number of commits per minute by using the number of distinct commits in each
+push event.
+
+```sql
+SELECT date_trunc('minute', created_at) AS minute,
+       sum((payload->>'distinct_size')::int) AS num_commits
+FROM github_events
+WHERE event_type = 'PushEvent'
+GROUP BY minute
+ORDER BY minute;
+```
+
+We also have a users table. We can also easily join the users with events, and
+find the top ten users who created the most repositories.
+
+```sql
+SELECT login, count(*)
+FROM github_events ge
+JOIN github_users gu
+ON ge.user_id = gu.user_id
+WHERE event_type = 'CreateEvent' AND payload @> '{"ref_type": "repository"}'
+GROUP BY login
+ORDER BY count(*) DESC LIMIT 10;
+```
+
+**View query plan:**
+
+First, add more workers using `docker-compose scale`. For instance, to bring
+your worker count to five.
+
+```sh
+$ docker-compose -p cit scale worker=5
+```
+
+Then, rebalance shards.
+
+```sql
+-- move shards to new worker node(s)
+SELECT rebalance_table_shards();
+```
+
+```sql
+EXPLAIN SELECT login, count(*)
+FROM github_events ge
+JOIN github_users gu
+ON ge.user_id = gu.user_id
+WHERE event_type = 'CreateEvent' AND payload @> '{"ref_type": "repository"}'
+GROUP BY login
+ORDER BY count(*) DESC LIMIT 10;
+                                                        QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=507.82..507.85 rows=10 width=40)
+   ->  Sort  (cost=507.82..508.32 rows=200 width=40)
+         Sort Key: (COALESCE((pg_catalog.sum(remote_scan.count))::bigint, '0'::bigint)) DESC
+         ->  HashAggregate  (cost=500.00..503.50 rows=200 width=40)
+               Group Key: remote_scan.login
+               ->  Custom Scan (Citus Adaptive)  (cost=0.00..0.00 rows=100000 width=40)
+                     Task Count: 32
+                     Tasks Shown: One of 32
+                     ->  Task
+                           Node: host=cit_worker_3 port=5432 dbname=postgres
+                           ->  GroupAggregate  (cost=385.90..386.06 rows=9 width=18)
+                                 Group Key: gu.login
+                                 ->  Sort  (cost=385.90..385.92 rows=9 width=10)
+                                       Sort Key: gu.login
+                                       ->  Hash Join  (cost=358.72..385.76 rows=9 width=10)
+                                             Hash Cond: (ge.user_id = gu.user_id)
+                                             ->  Bitmap Heap Scan on github_events_102040 ge  (cost=17.74..44.65 rows=9 width=8)
+                                                   Recheck Cond: ((event_type = 'CreateEvent'::text) AND (payload @> '{"ref_type": "repository"}'::jsonb))
+                                                   ->  BitmapAnd  (cost=17.74..17.74 rows=9 width=0)
+                                                         ->  Bitmap Index Scan on event_type_index_102040  (cost=0.00..5.03 rows=117 width=0)
+                                                               Index Cond: (event_type = 'CreateEvent'::text)
+                                                         ->  Bitmap Index Scan on payload_index_102040  (cost=0.00..12.46 rows=61 width=0)
+                                                               Index Cond: (payload @> '{"ref_type": "repository"}'::jsonb)
+                                             ->  Hash  (cost=237.10..237.10 rows=8310 width=18)
+                                                   ->  Seq Scan on github_users_102008 gu  (cost=0.00..237.10 rows=8310 width=18)
+```
+
+Citus also supports standard `INSERT`, `UPDATE`, and `DELETE` commands for
+ingesting and modifying data. For example, you can update a user’s display login
+by running the following command:
+
+```sql
+UPDATE github_users SET display_login = 'no1youknow' WHERE user_id = 24305673;
+```
+
+With this, we come to the end of our tutorial. As a next step, you can look at
+the Real-Time Apps section to see how you can model your own data and power
+real-time analytical applications.
 
 [image size]: https://microbadger.com/images/citusdata/citus
 [release]: https://github.com/citusdata/docker/releases/latest
